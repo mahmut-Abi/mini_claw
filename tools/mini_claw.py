@@ -69,6 +69,16 @@ from dify_plugin.entities.model.message import (
 from dify_plugin.entities.tool import ToolInvokeMessage
 from utils.mini_claw_memory import _append_daily_dialogue, _dt_beijing, _reset_role
 
+from tools.mini_claw_vision import _ensure_base64_data
+from tools.mini_claw_helpers import (
+    estimate_tokens,
+    estimate_prompt_tokens,
+    message_to_text,
+    _user_explicitly_requested_skill,
+)
+from tools.mini_claw_persona import _md_pick_field, _md_set_field, _soul_set_core, _soul_set_vibe
+from tools.mini_claw_memory_ops import _memory_merge_managed_block
+
 
 class SkillAgentTool(Tool):
     def _invoke(self, tool_parameters: dict[str, Any]) -> Generator[ToolInvokeMessage]:
@@ -691,22 +701,6 @@ class SkillAgentTool(Tool):
                 )
             )
 
-        def _ensure_base64_data(entry: dict[str, Any]) -> str:
-            b64 = str(entry.get("base64_data") or "").strip()
-            if b64:
-                return b64
-            path = str(entry.get("abs_path") or "").strip()
-            if not path or not os.path.isfile(path):
-                return ""
-            try:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                b64 = base64.b64encode(raw).decode("ascii")
-            except Exception:
-                return ""
-            entry["base64_data"] = b64
-            return b64
-
         def build_user_message(*, text: str, mode: str) -> Any:
             if mode in {"default", "all_base64"} and image_entries:
                 vision_hint = "你已收到用户上传的图片，请直接查看并分析图片内容（不要声称无法查看图片）。\n"
@@ -788,34 +782,6 @@ class SkillAgentTool(Tool):
         messages.append(build_user_message(text=effective_query, mode="default"))
 
         conversation_summary: str = ""
-
-        def estimate_tokens(text: Any) -> int:
-            s = str(text or "")
-            return max(1, (len(s) // 4) + 1)
-
-        def message_to_text(msg: Any) -> str:
-            content = getattr(msg, "content", None)
-            if content is None:
-                content = _safe_get(msg, "content")
-            if isinstance(content, list):
-                acc: list[str] = []
-                for item in content:
-                    if isinstance(item, dict):
-                        t = item.get("text") or item.get("content") or item.get("data") or ""
-                        if t:
-                            acc.append(str(t))
-                    elif item:
-                        acc.append(str(item))
-                return "\n".join(acc).strip()
-            if isinstance(content, dict):
-                return json.dumps(content, ensure_ascii=False)
-            return str(content or "").strip()
-
-        def estimate_prompt_tokens(msgs: list[Any]) -> int:
-            total = 0
-            for m in msgs:
-                total += estimate_tokens(message_to_text(m))
-            return total
 
         def invoke_llm_text(prompt_messages: list[Any]) -> str:
             try:
@@ -914,90 +880,6 @@ class SkillAgentTool(Tool):
                 return obj if isinstance(obj, dict) else {}
             except Exception:
                 return {}
-
-        def _memory_merge_managed_block(existing_memory_md: str, updates: dict[str, Any]) -> str:
-            existing = str(existing_memory_md or "").strip()
-            if not existing:
-                existing = "# MEMORY.md - Long-term Memory\n\n"
-
-            def norm_kv(d: Any) -> dict[str, str]:
-                if not isinstance(d, dict):
-                    return {}
-                out: dict[str, str] = {}
-                for k, v in d.items():
-                    kk = str(k or "").strip()
-                    vv = str(v or "").strip()
-                    if not kk or not vv:
-                        continue
-                    if len(kk) > 24:
-                        kk = kk[:24]
-                    if len(vv) > 200:
-                        vv = vv[:200]
-                    out[kk] = vv
-                return out
-
-            def norm_list(xs: Any) -> list[str]:
-                if not isinstance(xs, list):
-                    return []
-                out: list[str] = []
-                for x in xs:
-                    s = str(x or "").strip()
-                    if not s:
-                        continue
-                    if len(s) > 240:
-                        s = s[:240]
-                    if s not in out:
-                        out.append(s)
-                return out
-
-            user_prefs = norm_kv(updates.get("user_preferences"))
-            project_facts = norm_kv(updates.get("project_facts"))
-            decisions = norm_list(updates.get("decisions"))
-
-            marker = "## Managed Memory (auto)"
-            lines = existing.splitlines()
-            start = -1
-            for i, line in enumerate(lines):
-                if line.strip() == marker:
-                    start = i
-                    break
-            if start != -1:
-                end = len(lines)
-                for j in range(start + 1, len(lines)):
-                    if lines[j].startswith("## ") and lines[j].strip() != marker:
-                        end = j
-                        break
-                preserved = "\n".join(lines[:start]).rstrip() + "\n\n" + "\n".join(lines[end:]).lstrip()
-                existing = preserved.strip() + "\n"
-
-            def render_section(title: str, kv: dict[str, str]) -> list[str]:
-                if not kv:
-                    return [f"### {title}", "- (empty)"]
-                out = [f"### {title}"]
-                for k in sorted(kv.keys()):
-                    out.append(f"- **{k}:** {kv[k]}")
-                return out
-
-            def render_list(title: str, items: list[str]) -> list[str]:
-                if not items:
-                    return [f"### {title}", "- (empty)"]
-                out = [f"### {title}"]
-                for it in items:
-                    out.append(f"- {it}")
-                return out
-
-            managed: list[str] = [marker]
-            managed.append(f"- updated_at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-            managed.append("")
-            managed.extend(render_section("User Preferences", user_prefs))
-            managed.append("")
-            managed.extend(render_section("Project Facts", project_facts))
-            managed.append("")
-            managed.extend(render_list("Decisions", decisions))
-            managed.append("")
-
-            merged = existing.rstrip() + "\n\n" + "\n".join(managed).rstrip() + "\n"
-            return merged
 
         def _memory_flush_for_compaction(*, text: str) -> None:
             existing_md = _storage_get_text(storage, memory_key).strip()
@@ -1250,19 +1132,6 @@ class SkillAgentTool(Tool):
         tool_call_sig_history: list[str] = []
         tool_call_sig_result_history: list[tuple[str, str]] = []
         loop_warned_sigs: set[str] = set()
-
-        def _user_explicitly_requested_skill(text: str, *, skill_id: str, display_name: str) -> bool:
-            s = str(text or "")
-            if not s:
-                return False
-            s_lower = s.lower()
-            sid = str(skill_id or "").strip().lower()
-            if sid and sid in s_lower:
-                return True
-            dn = str(display_name or "").strip().lower()
-            if dn and dn in s_lower:
-                return True
-            return False
 
         try:
             for step_idx in range(max_tool_turns):
@@ -1684,134 +1553,6 @@ class SkillAgentTool(Tool):
                                 "memory_md": _storage_get_text(storage, memory_key).strip(),
                             }
                         elif tool_name == "update_persona":
-                            def _md_pick_field(md: str, key: str) -> str:
-                                s = str(md or "")
-                                if not s:
-                                    return ""
-                                m = re.search(
-                                    rf"^\s*(?:-\s*)?\*\*\s*{re.escape(key)}\s*:\s*\*\*\s*(.+?)\s*$",
-                                    s,
-                                    flags=re.M | re.I,
-                                )
-                                return str(m.group(1) or "").strip() if m else ""
-
-                            def _md_set_field(md: str, *, key: str, value: str, header: str) -> str:
-                                s = str(md or "").strip()
-                                if not s:
-                                    s = header.strip() + "\n"
-                                lines = s.splitlines()
-                                rx = re.compile(rf"^\s*(?:-\s*)?\*\*\s*{re.escape(key)}\s*:\s*\*\*\s*(.*)\s*$", flags=re.I)
-                                out: list[str] = []
-                                replaced = False
-                                for line in lines:
-                                    if rx.match(line):
-                                        out.append(f"- **{key}:** {value}".rstrip())
-                                        replaced = True
-                                    else:
-                                        out.append(line)
-                                if not replaced:
-                                    if out and out[-1].strip():
-                                        out.append("")
-                                    out.append(f"- **{key}:** {value}".rstrip())
-                                return "\n".join(out).strip() + "\n"
-
-                            def _soul_set_vibe(md: str, vibe: str) -> str:
-                                s = str(md or "").strip()
-                                if not s:
-                                    return (
-                                        "# SOUL.md - Who You Are\n\n"
-                                        "## Core\n"
-                                        "- 说人话，少模板；可以小调皮，但不油腻。\n"
-                                        "- 语气不要刻意迎合，但要给与用户足够的尊重。\n"
-                                        "- 有主见，但不自作主张，遇到不确定的事情时，会向用户询问。\n"
-                                        "- 幽默是你的底色，善良是你的天性，你会主动关心用户。\n"
-
-                                        "## Vibe\n"
-                                        f"{vibe}\n"
-                                    )
-                                lines = s.splitlines()
-                                out: list[str] = []
-                                i = 0
-                                replaced = False
-                                while i < len(lines):
-                                    line = lines[i]
-                                    if re.match(r"^\s*##\s+Vibe\s*$", line, flags=re.I):
-                                        out.append(line)
-                                        out.append(vibe)
-                                        replaced = True
-                                        i += 1
-                                        while i < len(lines) and not re.match(r"^\s*##\s+", lines[i]):
-                                            i += 1
-                                        continue
-                                    out.append(line)
-                                    i += 1
-                                if not replaced:
-                                    if out and out[-1].strip():
-                                        out.append("")
-                                    out.extend(["## Vibe", vibe])
-                                return "\n".join(out).strip() + "\n"
-
-                            def _soul_set_core(md: str, core_rules: list[str]) -> str:
-                                cleaned: list[str] = []
-                                for raw in core_rules or []:
-                                    s = str(raw or "").strip()
-                                    if not s:
-                                        continue
-                                    s = re.sub(r"^\s*\d+\s*[\.\)、]\s*", "", s).strip()
-                                    if not s:
-                                        continue
-                                    if s.startswith("-"):
-                                        s = s.lstrip("-").strip()
-                                    if not s:
-                                        continue
-                                    if len(s) > 240:
-                                        s = s[:240]
-                                    if s not in cleaned:
-                                        cleaned.append(s)
-                                if not cleaned:
-                                    return str(md or "").strip() + ("\n" if str(md or "").strip() else "")
-
-                                s = str(md or "").strip()
-                                if not s:
-                                    s = "# SOUL.md - Who You Are\n\n## Core\n\n"
-
-                                lines = s.splitlines()
-                                core_titles = {"Core", "Core Truths"}
-                                start = -1
-                                for i, line in enumerate(lines):
-                                    m = re.match(r"^\s*##\s+(.+?)\s*$", line)
-                                    if not m:
-                                        continue
-                                    title = str(m.group(1) or "").strip()
-                                    if title in core_titles:
-                                        start = i
-                                        break
-
-                                def render_core_block() -> list[str]:
-                                    out: list[str] = ["## Core"]
-                                    for rule in cleaned:
-                                        out.append(f"- {rule}")
-                                    return out
-
-                                if start != -1:
-                                    end = len(lines)
-                                    for j in range(start + 1, len(lines)):
-                                        if re.match(r"^\s*##\s+", lines[j]):
-                                            end = j
-                                            break
-                                    next_lines = lines[:start] + render_core_block() + [""] + lines[end:]
-                                    return "\n".join(next_lines).strip() + "\n"
-
-                                insert_at = 0
-                                if lines and lines[0].lstrip().startswith("#"):
-                                    insert_at = 1
-                                    while insert_at < len(lines) and lines[insert_at].strip():
-                                        insert_at += 1
-                                    while insert_at < len(lines) and not lines[insert_at].strip():
-                                        insert_at += 1
-                                next_lines = lines[:insert_at] + ([""] if insert_at and lines[insert_at - 1].strip() else []) + render_core_block() + [""] + lines[insert_at:]
-                                return "\n".join(next_lines).strip() + "\n"
-
                             mode = str(arguments.get("mode") or "apply").strip().lower()
                             if mode not in {"apply", "preview"}:
                                 mode = "apply"
