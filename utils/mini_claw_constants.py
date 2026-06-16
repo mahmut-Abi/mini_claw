@@ -15,14 +15,11 @@ EXEC_ALLOWED_BINS = {
     "npx",
     "bun",
     "uvx",
-    "wget",
     "git",
-    "bash",
     "uv",
     "cp",
     "mv",
     "ls",
-    "curl",
 }
 EXEC_TRUSTED_DIR_PREFIXES = (
     "/usr/bin/",

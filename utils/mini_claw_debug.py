@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from utils.tools import _safe_get
 
+logger = logging.getLogger("mini_claw")
+
 
 def _dbg(msg: str) -> None:
-    try:
-        print(f"[skill][debug] {msg}", flush=True)
-    except Exception:
-        return
+    logger.debug("[skill] %s", msg)
 
 
 def _model_brief(model_config: Any) -> str:
